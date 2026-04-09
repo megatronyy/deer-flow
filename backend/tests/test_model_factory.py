@@ -73,7 +73,7 @@ def _patch_factory(monkeypatch, app_config: AppConfig, model_class=FakeChatModel
     """Patch get_app_config, resolve_class, and tracing for isolated unit tests."""
     monkeypatch.setattr(factory_module, "get_app_config", lambda: app_config)
     monkeypatch.setattr(factory_module, "resolve_class", lambda path, base: model_class)
-    monkeypatch.setattr(factory_module, "is_tracing_enabled", lambda: False)
+    monkeypatch.setattr(factory_module, "build_tracing_callbacks", lambda: [])
 
 
 # ---------------------------------------------------------------------------
@@ -95,10 +95,21 @@ def test_uses_first_model_when_name_is_none(monkeypatch):
 def test_raises_when_model_not_found(monkeypatch):
     cfg = _make_app_config([_make_model("only-model")])
     monkeypatch.setattr(factory_module, "get_app_config", lambda: cfg)
-    monkeypatch.setattr(factory_module, "is_tracing_enabled", lambda: False)
+    monkeypatch.setattr(factory_module, "build_tracing_callbacks", lambda: [])
 
     with pytest.raises(ValueError, match="ghost-model"):
         factory_module.create_chat_model(name="ghost-model")
+
+
+def test_appends_all_tracing_callbacks(monkeypatch):
+    cfg = _make_app_config([_make_model("alpha")])
+    _patch_factory(monkeypatch, cfg)
+    monkeypatch.setattr(factory_module, "build_tracing_callbacks", lambda: ["smith-callback", "langfuse-callback"])
+
+    FakeChatModel.captured_kwargs = {}
+    model = factory_module.create_chat_model(name="alpha")
+
+    assert model.callbacks == ["smith-callback", "langfuse-callback"]
 
 
 # ---------------------------------------------------------------------------
@@ -593,6 +604,63 @@ def test_codex_provider_strips_unsupported_max_tokens(monkeypatch):
     assert "max_tokens" not in FakeChatModel.captured_kwargs
 
 
+def test_thinking_disabled_vllm_chat_template_format(monkeypatch):
+    wte = {"extra_body": {"chat_template_kwargs": {"thinking": True}}}
+    model = _make_model(
+        "vllm-qwen",
+        use="deerflow.models.vllm_provider:VllmChatModel",
+        supports_thinking=True,
+        when_thinking_enabled=wte,
+    )
+    model.extra_body = {"top_k": 20}
+    cfg = _make_app_config([model])
+    _patch_factory(monkeypatch, cfg)
+
+    captured: dict = {}
+
+    class CapturingModel(FakeChatModel):
+        def __init__(self, **kwargs):
+            captured.update(kwargs)
+            BaseChatModel.__init__(self, **kwargs)
+
+    monkeypatch.setattr(factory_module, "resolve_class", lambda path, base: CapturingModel)
+
+    factory_module.create_chat_model(name="vllm-qwen", thinking_enabled=False)
+
+    assert captured.get("extra_body") == {"top_k": 20, "chat_template_kwargs": {"thinking": False}}
+    assert captured.get("reasoning_effort") is None
+
+
+def test_thinking_disabled_vllm_enable_thinking_format(monkeypatch):
+    wte = {"extra_body": {"chat_template_kwargs": {"enable_thinking": True}}}
+    model = _make_model(
+        "vllm-qwen-enable",
+        use="deerflow.models.vllm_provider:VllmChatModel",
+        supports_thinking=True,
+        when_thinking_enabled=wte,
+    )
+    model.extra_body = {"top_k": 20}
+    cfg = _make_app_config([model])
+    _patch_factory(monkeypatch, cfg)
+
+    captured: dict = {}
+
+    class CapturingModel(FakeChatModel):
+        def __init__(self, **kwargs):
+            captured.update(kwargs)
+            BaseChatModel.__init__(self, **kwargs)
+
+    monkeypatch.setattr(factory_module, "resolve_class", lambda path, base: CapturingModel)
+
+    factory_module.create_chat_model(name="vllm-qwen-enable", thinking_enabled=False)
+
+    assert captured.get("extra_body") == {
+        "top_k": 20,
+        "chat_template_kwargs": {"enable_thinking": False},
+    }
+    assert captured.get("reasoning_effort") is None
+
+
 def test_openai_responses_api_settings_are_passed_to_chatopenai(monkeypatch):
     model = ModelConfig(
         name="gpt-5-responses",
@@ -622,3 +690,44 @@ def test_openai_responses_api_settings_are_passed_to_chatopenai(monkeypatch):
 
     assert captured.get("use_responses_api") is True
     assert captured.get("output_version") == "responses/v1"
+
+
+# ---------------------------------------------------------------------------
+# Duplicate keyword argument collision (issue #1977)
+# ---------------------------------------------------------------------------
+
+
+def test_no_duplicate_kwarg_when_reasoning_effort_in_config_and_thinking_disabled(monkeypatch):
+    """When reasoning_effort is set in config.yaml (extra field) AND the thinking-disabled
+    path also injects reasoning_effort=minimal into kwargs, the factory must not raise
+    TypeError: got multiple values for keyword argument 'reasoning_effort'."""
+    wte = {"extra_body": {"thinking": {"type": "enabled", "budget_tokens": 5000}}}
+    # ModelConfig.extra="allow" means extra fields from config.yaml land in model_dump()
+    model = ModelConfig(
+        name="doubao-model",
+        display_name="Doubao 1.8",
+        description=None,
+        use="deerflow.models.patched_deepseek:PatchedChatDeepSeek",
+        model="doubao-seed-1-8-250315",
+        reasoning_effort="high",  # user-set extra field in config.yaml
+        supports_thinking=True,
+        supports_reasoning_effort=True,
+        when_thinking_enabled=wte,
+        supports_vision=False,
+    )
+    cfg = _make_app_config([model])
+
+    captured: dict = {}
+
+    class CapturingModel(FakeChatModel):
+        def __init__(self, **kwargs):
+            captured.update(kwargs)
+            BaseChatModel.__init__(self, **kwargs)
+
+    _patch_factory(monkeypatch, cfg, model_class=CapturingModel)
+
+    # Must not raise TypeError
+    factory_module.create_chat_model(name="doubao-model", thinking_enabled=False)
+
+    # kwargs (runtime) takes precedence: thinking-disabled path sets reasoning_effort=minimal
+    assert captured.get("reasoning_effort") == "minimal"
